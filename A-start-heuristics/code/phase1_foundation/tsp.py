@@ -354,7 +354,7 @@ if __name__ == "__main__":
     print("\nTesting TSPLIB loader with embedded wi29...\n")
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        tsp_path = download_wi29(save_dir=tmpdir)
+        tsp_path = download_wi29(save_dir=os.path.join(ROOT_DIR, 'data'))
         cities   = load_tsplib(tsp_path)
         dist     = build_distance_matrix(cities)
 
