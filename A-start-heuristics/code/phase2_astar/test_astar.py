@@ -1,479 +1,400 @@
+"""
+frontier.py — Explicit Frontier and VisitedSet classes for A* memory analysis.
+
+Phase 2 A* Core — A* Search for TSP
+Repository: https://github.com/Francis-Ajibade/A-star-tsp-heuristic
+
+Provides:
+    Frontier         — min-heap priority queue with lazy deletion and peak tracking
+    VisitedSet       — best-g-cost table with staleness detection and update counting
+    astar_with_frontier() — A* using these classes, returning extended stats for
+                            Phase 4 memory and efficiency experiments
+
+Relationship to astar.py:
+    astar_tsp() in astar.py implements the same algorithm with an inline heap
+    and dict for maximum clarity. astar_with_frontier() wraps identical logic
+    in Frontier and VisitedSet objects so Phase 4 can inspect frontier peak
+    size, visited set memory, and update counts without instrumenting astar.py.
+    Both functions must return the same optimal cost for any given instance.
+"""
+
 from __future__ import annotations
+import heapq
+import time
 import sys
 import os
-import math
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'phase1_foundation'))
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'phase2_astar'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'phase1_foundation'))
 
-from tsp import City, build_distance_matrix, generate_random_cities
 from state import TSPState, make_start_state
-from baseline import brute_force_tsp, tour_cost, all_optimal_tours
-from astar import astar_tsp, null_heuristic, min_edge_heuristic, AStarResult
-from frontier import Frontier, VisitedSet, astar_with_frontier
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Frontier ──────────────────────────────────────────────────────────────────
 
-PASS = "  PASS"
-FAIL = "  FAIL"
-SEP  = "=" * 55
-
-
-def check(label: str, condition: bool, detail: str = "") -> bool:
-    status = PASS if condition else FAIL
-    line   = f"{status} | {label}"
-    if detail:
-        line += f"  ({detail})"
-    print(line)
-    return condition
-
-
-def section(title: str) -> None:
-    print(f"\n{SEP}")
-    print(f"  {title}")
-    print(SEP)
-
-
-def make_dist(*cities: City) -> list[list[float]]:
-    return build_distance_matrix(list(cities))
-
-
-# ── Test 1: null heuristic == brute force ─────────────────────────────────────
-
-def test_null_heuristic_correctness() -> int:
+class Frontier:
     """
-    A* with h(n)=0 is Uniform Cost Search and MUST find the exact
-    optimal cost on every instance. If this fails, the bug is in
-    state expansion or the search loop — not the heuristic.
+    Min-heap priority queue for A* search ordered by f(n) = g(n) + h(n).
+
+    Design decisions:
+        Lazy deletion: when a better path to a state is found, the improved
+        entry is pushed without removing the stale one. Stale entries are
+        detected and discarded in pop() using the VisitedSet. This avoids
+        the O(n) cost of heap search-and-remove and keeps push() at O(log n).
+
+        Tie-breaking: equal f-values are broken by insertion counter so that
+        earlier pushes are popped first (FIFO within a priority level). This
+        avoids direct TSPState comparison, which is unreliable for float
+        f-values, and keeps search behaviour deterministic.
+
+        Peak tracking: self.peak_size records the maximum number of live
+        (non-stale) entries seen, reported in Phase 4 memory experiments.
+
+    Attributes:
+        peak_size (int): Maximum live entry count observed during the search.
     """
-    section("1. Null heuristic correctness (UCS baseline)")
-    failures = 0
 
-    instances = [
-        # (label, cities)
-        ("unit square 4",  [City("A",0,0), City("B",1,0), City("C",1,1), City("D",0,1)]),
-        ("collinear 3",    [City("A",0,0), City("B",1,0), City("C",2,0)]),
-        ("standard 5",     [City("A",0,0), City("B",2,4), City("C",5,2),
-                            City("D",6,6), City("E",1,7)]),
-        ("random 6",       generate_random_cities(6, seed=42)),
-        ("random 7",       generate_random_cities(7, seed=7)),
-        ("random 8",       generate_random_cities(8, seed=13)),
-    ]
+    def __init__(self) -> None:
+        self._heap    : list[tuple] = []   # (f, counter, state)
+        self._counter : int         = 0    # monotonic insertion index
+        self._size    : int         = 0    # estimated live (non-stale) entries
+        self.peak_size: int         = 0    # maximum live count seen
 
-    for label, cities in instances:
-        dist          = build_distance_matrix(cities)
-        bf_path, bf_cost = brute_force_tsp(dist)
-        result        = astar_tsp(dist, null_heuristic)
+    def push(self, state: TSPState, f: float) -> None:
+        """
+        Insert a state with priority f into the frontier.
 
-        ok = check(
-            f"{label}: A* cost == brute-force",
-            result is not None and abs(result.cost - bf_cost) < 1e-6,
-            f"A*={result.cost:.4f} BF={bf_cost:.4f}" if result else "no result",
+        Duplicate states are permitted — the VisitedSet identifies stale
+        entries on pop. The live size estimate and peak are updated here.
+
+        Args:
+            state: the TSPState to enqueue.
+            f:     f(n) = g(n) + h(n) priority value.
+        """
+        heapq.heappush(self._heap, (f, self._counter, state))
+        self._counter += 1
+        self._size    += 1
+        if self._size > self.peak_size:
+            self.peak_size = self._size
+
+    def pop(self, visited: VisitedSet) -> TSPState | None:
+        """
+        Remove and return the lowest-f state that is not stale.
+
+        An entry is stale when the VisitedSet holds a strictly cheaper g_cost
+        for the same (current_city, visited_frozenset) key — meaning a better
+        path was discovered and pushed after this entry was enqueued.
+
+        Args:
+            visited: the VisitedSet used by the current search run.
+
+        Returns:
+            The lowest-f non-stale TSPState, or None if the heap is empty.
+        """
+        while self._heap:
+            f, _, state = heapq.heappop(self._heap)
+            self._size -= 1
+
+            if not visited.is_stale(state):
+                return state
+            # Stale entry — discard and continue to next
+
+        return None   # heap exhausted
+
+    def peek_f(self) -> float | None:
+        """
+        Return the lowest f(n) currently in the heap without removing it.
+
+        Returns None if the heap is empty. Note: the peeked entry may be stale.
+        """
+        return self._heap[0][0] if self._heap else None
+
+    def is_empty(self) -> bool:
+        """Return True when the heap contains no entries (including stale)."""
+        return len(self._heap) == 0
+
+    def live_size(self) -> int:
+        """
+        Approximate number of non-stale entries in the heap.
+
+        Decremented on each push that replaces a previous entry and on each
+        pop. Because stale entries are only identified lazily, this is an
+        estimate rather than an exact count.
+        """
+        return self._size
+
+    def __len__(self) -> int:
+        """Total heap entries including stale ones — use for raw memory sizing."""
+        return len(self._heap)
+
+    def __repr__(self) -> str:
+        return (
+            f"Frontier(heap_size={len(self._heap)}, "
+            f"live~={self._size}, peak={self.peak_size})"
         )
-        failures += 0 if ok else 1
-
-        if result:
-            ok = check(
-                f"{label}: tour visits all cities",
-                len(set(result.path)) == len(cities),
-            )
-            failures += 0 if ok else 1
-
-            ok = check(
-                f"{label}: tour starts and ends at city 0",
-                result.path[0] == 0 and result.path[-1] == 0,
-            )
-            failures += 0 if ok else 1
-
-            ok = check(
-                f"{label}: tour cost consistent with path",
-                abs(tour_cost(result.path, dist) - result.cost) < 1e-6,
-            )
-            failures += 0 if ok else 1
-
-    return failures
 
 
-# ── Test 2: min-edge heuristic correctness ────────────────────────────────────
+# ── Visited set ───────────────────────────────────────────────────────────────
 
-def test_min_edge_correctness() -> int:
+class VisitedSet:
     """
-    Min-edge heuristic must still find the optimal cost on all instances.
-    A heuristic is only useful if it doesn't sacrifice optimality.
+    Tracks the cheapest g_cost seen for every (current_city, visited) pair.
+
+    Two responsibilities:
+        Record keeping:   store and update the best g_cost per state identity.
+        Staleness check:  tell Frontier.pop() whether a popped entry is outdated.
+
+    Why not a simple closed list?
+        A closed list works correctly when the heuristic is consistent — a
+        consistent heuristic guarantees that the first expansion of a state
+        always uses the optimal g_cost, so it never needs to be revisited.
+        When using heuristics that are admissible but not proven consistent,
+        the best-g approach is safer: it re-expands a state only if a strictly
+        cheaper path is found, and skips all duplicates otherwise.
+
+    Attributes:
+        updates (int): Number of times a state was reached via a cheaper path
+                       than previously recorded. Useful for diagnosing how
+                       often the heuristic fails to be consistent.
     """
-    section("2. Min-edge heuristic correctness")
-    failures = 0
 
-    instances = [
-        ("unit square 4", [City("A",0,0), City("B",1,0), City("C",1,1), City("D",0,1)]),
-        ("standard 5",    [City("A",0,0), City("B",2,4), City("C",5,2),
-                           City("D",6,6), City("E",1,7)]),
-        ("random 6",      generate_random_cities(6, seed=42)),
-        ("random 7",      generate_random_cities(7, seed=7)),
-        ("random 8",      generate_random_cities(8, seed=13)),
-    ]
+    def __init__(self) -> None:
+        self._best_g: dict[tuple, float] = {}
+        self.updates: int = 0
 
-    for label, cities in instances:
-        dist             = build_distance_matrix(cities)
-        _, bf_cost       = brute_force_tsp(dist)
-        result           = astar_tsp(dist, min_edge_heuristic)
+    def should_visit(self, state: TSPState) -> bool:
+        """
+        Return True if this state should be pushed onto the frontier.
 
-        ok = check(
-            f"{label}: min-edge cost == brute-force",
-            result is not None and abs(result.cost - bf_cost) < 1e-6,
-            f"A*={result.cost:.4f} BF={bf_cost:.4f}" if result else "no result",
+        Returns True and updates the stored g_cost when:
+            - This (current_city, visited) pair has never been seen before, OR
+            - The new g_cost is strictly cheaper than the previously recorded best.
+
+        Returns False (and does not update) when the new g_cost is equal to
+        or worse than the known best, meaning this path cannot improve on what
+        is already queued.
+
+        Args:
+            state: the candidate state to evaluate.
+
+        Returns:
+            True if the state should be expanded; False if it should be pruned.
+        """
+        key  = self._key(state)
+        best = self._best_g.get(key, float("inf"))
+
+        if state.g_cost < best - 1e-9:
+            if key in self._best_g:
+                self.updates += 1   # a cheaper path superseded a previous one
+            self._best_g[key] = state.g_cost
+            return True
+
+        return False
+
+    def is_stale(self, state: TSPState) -> bool:
+        """
+        Return True if the recorded best g_cost for this state is cheaper
+        than state.g_cost, meaning this heap entry has been superseded.
+
+        Used by Frontier.pop() to filter out outdated entries without
+        searching or modifying the heap.
+
+        Args:
+            state: the state popped from the heap.
+
+        Returns:
+            True if the entry should be discarded; False if it should be expanded.
+        """
+        key  = self._key(state)
+        best = self._best_g.get(key, float("inf"))
+        return state.g_cost > best + 1e-9
+
+    def best_cost_for(self, state: TSPState) -> float | None:
+        """
+        Return the best g_cost recorded for this state's identity, or None
+        if this (current_city, visited) pair has not been seen.
+        """
+        return self._best_g.get(self._key(state))
+
+    def states_seen(self) -> int:
+        """Total unique (current_city, visited) pairs recorded."""
+        return len(self._best_g)
+
+    def memory_bytes(self) -> int:
+        """
+        Rough estimate of the VisitedSet memory footprint in bytes.
+
+        Approximates each entry as 200 bytes (frozenset key + int city index +
+        float value + dict overhead). This is a heuristic estimate for Phase 4
+        reporting, not a precise measurement.
+        """
+        return len(self._best_g) * 200
+
+    @staticmethod
+    def _key(state: TSPState) -> tuple:
+        return (state.current_city, state.visited)
+
+    def __repr__(self) -> str:
+        return (
+            f"VisitedSet(unique_states={len(self._best_g)}, "
+            f"updates={self.updates})"
         )
-        failures += 0 if ok else 1
-
-    return failures
 
 
-# ── Test 3: heuristic admissibility ──────────────────────────────────────────
+# ── A* using Frontier + VisitedSet ────────────────────────────────────────────
 
-def test_admissibility() -> int:
+def astar_with_frontier(
+    dist      : list[list[float]],
+    heuristic : callable,
+    start     : int = 0,
+) -> dict | None:
     """
-    For every state reachable in a 5-city instance, verify:
-        h(state) <= true remaining cost to complete the tour optimally
+    A* search using the explicit Frontier and VisitedSet classes.
 
-    This is the mathematical proof-by-exhaustion that both heuristics
-    are admissible. Include this output in your report.
+    Produces the same optimal tour as astar_tsp() in astar.py but returns
+    a richer result dict that includes memory and frontier statistics. Used
+    by Phase 4 experiments to compare search effort across heuristics.
+
+    Note on return type:
+        Returns a dict (not AStarResult) to accommodate the extra fields
+        (frontier_peak, states_in_visited, visited_updates, memory_bytes)
+        that have no place in the lean AStarResult dataclass.
+
+    Args:
+        dist:      n×n distance matrix.
+        heuristic: callable(state: TSPState, dist: list) -> float.
+        start:     index of the start city, defaults to 0.
+
+    Returns:
+        Dict with keys: path, cost, nodes_expanded, nodes_generated,
+        runtime_ms, frontier_peak, states_in_visited, visited_updates,
+        memory_bytes, n_cities.
+        Returns None if no tour exists (frontier exhausted).
     """
-    section("3. Admissibility check — h(n) <= true remaining cost")
-    failures = 0
+    n        = len(dist)
+    frontier = Frontier()
+    visited  = VisitedSet()
+
+    start_state = make_start_state(start)
+    h0          = heuristic(start_state, dist)
+
+    visited.should_visit(start_state)     # register start before pushing
+    frontier.push(start_state, f=h0)
+
+    nodes_expanded  = 0
+    nodes_generated = 1                   # start state generated at init
+
+    t0 = time.perf_counter()
+
+    while True:
+        state = frontier.pop(visited)
+
+        if state is None:
+            return None   # frontier exhausted — no tour found
+
+        nodes_expanded += 1
+
+        if len(state.visited) > n:
+            # Terminal state (closed tour) — visited sentinel size > n flags completion
+            runtime_ms = (time.perf_counter() - t0) * 1000
+            return {
+                "path"              : state.path,
+                "cost"              : state.g_cost,
+                "nodes_expanded"    : nodes_expanded,
+                "nodes_generated"   : nodes_generated,
+                "runtime_ms"        : runtime_ms,
+                "frontier_peak"     : frontier.peak_size,
+                "states_in_visited" : visited.states_seen(),
+                "visited_updates"   : visited.updates,
+                "memory_bytes"      : visited.memory_bytes(),
+                "n_cities"          : n,
+            }
+
+        if state.is_goal(n):
+            # Push a terminal entry with the full closed-tour cost
+            from state import TSPState as _TSPState
+            return_cost = dist[state.current_city][state.path[0]]
+            terminal    = _TSPState(
+                current_city = state.path[0],
+                visited      = state.visited | {n},
+                g_cost       = state.g_cost + return_cost,
+                path         = state.full_tour(),
+            )
+            if visited.should_visit(terminal):
+                h = heuristic(terminal, dist)
+                frontier.push(terminal, f=terminal.g_cost + h)
+                nodes_generated += 1
+            continue
+
+        for successor in state.expand(dist):
+            if visited.should_visit(successor):
+                h = heuristic(successor, dist)
+                f = successor.g_cost + h
+                frontier.push(successor, f)
+                nodes_generated += 1
+
+
+# ── Smoke test ────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    from tsp      import City, build_distance_matrix
+    from baseline import brute_force_tsp
+
+    SEP = "=" * 55
+
+    def null_heuristic(state: TSPState, dist: list) -> float:
+        return 0.0
 
     cities = [
-        City("A",0,0), City("B",2,4), City("C",5,2),
-        City("D",6,6), City("E",1,7),
+        City("A", 0, 0),
+        City("B", 2, 4),
+        City("C", 5, 2),
+        City("D", 6, 6),
+        City("E", 1, 7),
     ]
-    dist = build_distance_matrix(cities)
-    n    = len(cities)
+    dist             = build_distance_matrix(cities)
+    bf_path, bf_cost = brute_force_tsp(dist)
 
-    # Collect every reachable state via BFS
-    all_states : list[TSPState] = []
-    queue       = [make_start_state(0)]
-    seen        : set[tuple]    = set()
+    print(f"\n{SEP}")
+    print("  Frontier + VisitedSet — smoke test")
+    print(SEP)
 
-    while queue:
-        state = queue.pop(0)
-        key   = (state.current_city, state.visited)
-        if key in seen:
-            continue
-        seen.add(key)
-        all_states.append(state)
-        if not state.is_goal(n):
-            queue.extend(state.expand(dist))
-
-    print(f"  States checked: {len(all_states)}")
-
-    heuristics = [
-        ("null",     null_heuristic),
-        ("min-edge", min_edge_heuristic),
-    ]
-
-    for h_name, h_fn in heuristics:
-        violations = 0
-        for state in all_states:
-            h_val = h_fn(state, dist)
-
-            # True remaining cost: cheapest completion from this state
-            true_remaining = _true_remaining_cost(state, dist, n)
-
-            if h_val > true_remaining + 1e-6:
-                violations += 1
-                print(f"  VIOLATION: {h_name} h={h_val:.4f} > true={true_remaining:.4f} "
-                      f"at city={state.current_city} visited={sorted(state.visited)}")
-
-        ok = check(
-            f"{h_name}: admissible across all {len(all_states)} states",
-            violations == 0,
-            f"{violations} violations" if violations else "no violations",
-        )
-        failures += 0 if ok else 1
-
-    return failures
-
-
-def _true_remaining_cost(
-    state : TSPState,
-    dist  : list[list[float]],
-    n     : int,
-) -> float:
-    """
-    Compute the true minimum remaining cost to complete the tour from state.
-    Uses brute-force over remaining cities — only feasible on small n.
-    """
-    unvisited = [c for c in range(n) if c not in state.visited]
-
-    if not unvisited:
-        # Only return edge remains
-        return dist[state.current_city][state.path[0]]
-
-    best = float('inf')
-    from itertools import permutations
-    for perm in permutations(unvisited):
-        cost  = dist[state.current_city][perm[0]]
-        cost += sum(dist[perm[i]][perm[i+1]] for i in range(len(perm)-1))
-        cost += dist[perm[-1]][state.path[0]]   # return to start
-        best  = min(best, cost)
-
-    return best
-
-
-# ── Test 4: heuristic pruning power ──────────────────────────────────────────
-
-def test_pruning_power() -> int:
-    """
-    A better heuristic must expand fewer nodes than a weaker one.
-    null >= min_edge in nodes expanded (null is worst, min-edge is better).
-    This sets up the comparison table you'll extend in Phase 3 with MST.
-    """
-    section("4. Pruning power — nodes expanded comparison")
-    failures = 0
-
-    instances = [
-        ("standard 5", [City("A",0,0), City("B",2,4), City("C",5,2),
-                        City("D",6,6), City("E",1,7)]),
-        ("random 6",   generate_random_cities(6, seed=42)),
-        ("random 7",   generate_random_cities(7, seed=7)),
-        ("random 8",   generate_random_cities(8, seed=13)),
-    ]
-
-    print(f"\n  {'Instance':<14} {'Null':>8} {'Min-edge':>10} {'Saved':>8}")
-    print(f"  {'-'*14} {'-'*8} {'-'*10} {'-'*8}")
-
-    for label, cities in instances:
-        dist   = build_distance_matrix(cities)
-        r_null = astar_tsp(dist, null_heuristic)
-        r_me   = astar_tsp(dist, min_edge_heuristic)
-
-        saved  = r_null.nodes_expanded - r_me.nodes_expanded
-        print(f"  {label:<14} {r_null.nodes_expanded:>8} "
-              f"{r_me.nodes_expanded:>10} {saved:>8}")
-
-        ok = check(
-            f"{label}: min-edge expands <= null",
-            r_me.nodes_expanded <= r_null.nodes_expanded,
-        )
-        failures += 0 if ok else 1
-
-    return failures
-
-
-# ── Test 5: Frontier + VisitedSet unit tests ──────────────────────────────────
-
-def test_frontier_and_visited() -> int:
-    """
-    Unit tests for the Frontier and VisitedSet classes in frontier.py.
-    Verifies ordering, staleness detection, and deduplication independently
-    of the full A* loop.
-    """
-    section("5. Frontier and VisitedSet unit tests")
-    failures = 0
-
-    # ── Frontier ordering ─────────────────────────────────────────────────────
+    # Frontier unit check
+    print("\n-- Frontier ordering check --")
     fr = Frontier()
     vs = VisitedSet()
 
-    s_high = make_start_state(0)
     s_low  = make_start_state(0)
+    s_high = make_start_state(0)
 
     fr.push(s_high, f=9.0)
     fr.push(s_low,  f=2.0)
     fr.push(s_high, f=5.0)
 
-    vs.should_visit(s_low)   # register so nothing is stale
+    vs.should_visit(s_low)   # register so neither entry appears stale
 
     popped = fr.pop(vs)
-    ok = check("frontier pops lowest f first",
-               popped is not None and popped.g_cost == s_low.g_cost)
-    failures += 0 if ok else 1
+    print(f"  Heap size after 3 pushes : {len(fr) + 1}")  # +1 for the popped entry
+    print(f"  First pop (expected f=2) : city={popped.current_city}, g={popped.g_cost}")
+    print(f"  Frontier repr            : {fr}")
+    print(f"  VisitedSet repr          : {vs}")
 
-    ok = check("frontier peak size tracked", fr.peak_size >= 2)
-    failures += 0 if ok else 1
+    # Full A* run via astar_with_frontier
+    print("\n-- Full A* run (null heuristic) --")
+    result = astar_with_frontier(dist, null_heuristic)
 
-    ok = check("frontier not empty after one pop", not fr.is_empty())
-    failures += 0 if ok else 1
+    tour_str = " → ".join(cities[i].name for i in result["path"])
+    print(f"  Tour               : {tour_str}")
+    print(f"  Cost               : {result['cost']:.4f}")
+    print(f"  Nodes expanded     : {result['nodes_expanded']}")
+    print(f"  Nodes generated    : {result['nodes_generated']}")
+    print(f"  Frontier peak      : {result['frontier_peak']}")
+    print(f"  Unique states      : {result['states_in_visited']}")
+    print(f"  Visited updates    : {result['visited_updates']}")
+    print(f"  Memory (estimate)  : {result['memory_bytes']} bytes")
+    print(f"  Runtime            : {result['runtime_ms']:.3f} ms")
 
-    # ── VisitedSet deduplication ──────────────────────────────────────────────
-    vs2 = VisitedSet()
-
-    state_cheap = TSPState(
-        current_city=1,
-        visited=frozenset({0, 1}),
-        g_cost=1.0,
-        path=[0, 1],
+    assert abs(result["cost"] - bf_cost) < 1e-6, (
+        f"Cost mismatch: A*={result['cost']:.4f}  BF={bf_cost:.4f}"
     )
-    state_expensive = TSPState(
-        current_city=1,
-        visited=frozenset({0, 1}),
-        g_cost=5.0,
-        path=[0, 1],
-    )
-
-    ok = check("first visit to state accepted",
-               vs2.should_visit(state_cheap))
-    failures += 0 if ok else 1
-
-    ok = check("more expensive path to same state rejected",
-               not vs2.should_visit(state_expensive))
-    failures += 0 if ok else 1
-
-    ok = check("expensive state is stale",
-               vs2.is_stale(state_expensive))
-    failures += 0 if ok else 1
-
-    ok = check("cheap state is not stale",
-               not vs2.is_stale(state_cheap))
-    failures += 0 if ok else 1
-
-    ok = check("updates counter stays 0 (no cheaper path found yet)",
-               vs2.updates == 0)
-    failures += 0 if ok else 1
-
-    # Push a cheaper path to same state — should trigger an update
-    state_cheaper = TSPState(
-        current_city=1,
-        visited=frozenset({0, 1}),
-        g_cost=0.5,
-        path=[0, 1],
-    )
-    ok = check("even cheaper path accepted",
-               vs2.should_visit(state_cheaper))
-    failures += 0 if ok else 1
-
-    ok = check("updates counter incremented",
-               vs2.updates == 1, f"got {vs2.updates}")
-    failures += 0 if ok else 1
-
-    ok = check("states_seen == 1 (same key, different costs)",
-               vs2.states_seen() == 1, f"got {vs2.states_seen()}")
-    failures += 0 if ok else 1
-
-    # ── astar_with_frontier agrees with astar_tsp ─────────────────────────────
-    cities = [City("A",0,0), City("B",2,4), City("C",5,2),
-              City("D",6,6), City("E",1,7)]
-    dist   = build_distance_matrix(cities)
-    _, bf  = brute_force_tsp(dist)
-
-    r_frontier = astar_with_frontier(dist, null_heuristic)
-    ok = check("astar_with_frontier cost == brute-force",
-               r_frontier is not None and abs(r_frontier["cost"] - bf) < 1e-6,
-               f"got {r_frontier['cost']:.4f}" if r_frontier else "None")
-    failures += 0 if ok else 1
-
-    ok = check("frontier_peak reported in result", "frontier_peak" in r_frontier)
-    failures += 0 if ok else 1
-
-    ok = check("memory_bytes reported in result", "memory_bytes" in r_frontier)
-    failures += 0 if ok else 1
-
-    return failures
-
-
-# ── Test 6: edge cases ────────────────────────────────────────────────────────
-
-def test_edge_cases() -> int:
-    """
-    Degenerate inputs: 1 city, 2 cities, already-at-goal start.
-    A* must not crash or return nonsense on these.
-    """
-    section("6. Edge cases")
-    failures = 0
-
-    # 1 city
-    dist_1 = build_distance_matrix([City("A",0,0)])
-    r1     = astar_tsp(dist_1, null_heuristic)
-    ok = check("1-city: result not None",   r1 is not None)
-    failures += 0 if ok else 1
-    if r1:
-        ok = check("1-city: cost == 0.0",  abs(r1.cost - 0.0) < 1e-9,
-                   f"got {r1.cost}")
-        failures += 0 if ok else 1
-
-    # 2 cities
-    dist_2 = build_distance_matrix([City("A",0,0), City("B",3,4)])
-    r2     = astar_tsp(dist_2, null_heuristic)
-    ok = check("2-city: cost == 10.0",
-               r2 is not None and abs(r2.cost - 10.0) < 1e-6,
-               f"got {r2.cost:.4f}" if r2 else "None")
-    failures += 0 if ok else 1
-
-    # AStarResult has all expected fields
-    if r2:
-        for field in ("path", "cost", "nodes_expanded",
-                      "nodes_generated", "runtime_ms", "n_cities"):
-            ok = check(f"AStarResult has field '{field}'", hasattr(r2, field))
-            failures += 0 if ok else 1
-
-    return failures
-
-
-# ── Test 7: result integrity ──────────────────────────────────────────────────
-
-def test_result_integrity() -> int:
-    """
-    Structural checks on AStarResult — the object Phase 4 will consume
-    for logging and charting. Every field must be present and sensible.
-    """
-    section("7. AStarResult integrity")
-    failures = 0
-
-    cities = [City("A",0,0), City("B",2,4), City("C",5,2),
-              City("D",6,6), City("E",1,7)]
-    dist   = build_distance_matrix(cities)
-    result = astar_tsp(dist, null_heuristic)
-
-    ok = check("result is not None", result is not None)
-    failures += 0 if ok else 1
-    if not result:
-        return failures
-
-    ok = check("cost > 0",                   result.cost > 0)
-    failures += 0 if ok else 1
-    ok = check("nodes_expanded > 0",         result.nodes_expanded > 0)
-    failures += 0 if ok else 1
-    ok = check("nodes_generated >= expanded", result.nodes_generated >= result.nodes_expanded)
-    failures += 0 if ok else 1
-    ok = check("runtime_ms > 0",             result.runtime_ms > 0)
-    failures += 0 if ok else 1
-    ok = check("n_cities == 5",              result.n_cities == 5)
-    failures += 0 if ok else 1
-    ok = check("path length == n+1",         len(result.path) == 6)
-    failures += 0 if ok else 1
-    ok = check("path starts at 0",           result.path[0] == 0)
-    failures += 0 if ok else 1
-    ok = check("path ends at 0",             result.path[-1] == 0)
-    failures += 0 if ok else 1
-    ok = check("path visits all 5 cities",   len(set(result.path)) == 5)
-    failures += 0 if ok else 1
-    ok = check("path cost consistent",
-               abs(tour_cost(result.path, dist) - result.cost) < 1e-6)
-    failures += 0 if ok else 1
-
-    return failures
-
-
-# ── Runner ────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    print("\nPhase 2 — A* Test Suite")
+    print(f"\n  Assertion passed: A* cost == brute-force ({bf_cost:.4f})")
     print(SEP)
-
-    total = 0
-    total += test_null_heuristic_correctness()
-    total += test_min_edge_correctness()
-    total += test_admissibility()
-    total += test_pruning_power()
-    total += test_frontier_and_visited()
-    total += test_edge_cases()
-    total += test_result_integrity()
-
-    print(f"\n{SEP}")
-    if total == 0:
-        print("  ALL TESTS PASSED — Phase 2 complete.")
-        print("  Ready to move to Phase 3: heuristic design.")
-    else:
-        print(f"  {total} TEST(S) FAILED — fix before proceeding.")
-    print(SEP)
-    sys.exit(0 if total == 0 else 1)

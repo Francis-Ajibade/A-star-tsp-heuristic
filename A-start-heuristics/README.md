@@ -18,10 +18,10 @@ The implementation compares multiple heuristics to analyze their impact on runti
 ## Repository Structure
 
 ```
-proposal/     Project proposal  
-src/          Core implementation (A* and heuristics)  
-data/         Sample TSP instances  
-experiments/  Scripts for testing and comparing heuristics  
+dataset/    Sample TSP instances used in experiments
+code/       Implementation of A* search and heuristic functions
+proposal/   Project proposal
+report/     Final project report
 ```
 
 ---
@@ -30,5 +30,3 @@ experiments/  Scripts for testing and comparing heuristics
 
 **CS4795 – Artificial Intelligence Project**
 University of New Brunswick
-
----
